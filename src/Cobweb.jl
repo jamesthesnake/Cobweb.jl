@@ -2,6 +2,10 @@ module Cobweb
 
 using DefaultApplication: DefaultApplication
 using Scratch: @get_scratch!
+using StructTypes
+using Random
+
+export Page
 
 #-----------------------------------------------------------------------------# init
 struct CobwebDisplay <: AbstractDisplay end
@@ -11,42 +15,74 @@ function __init__()
     pushdisplay(CobwebDisplay())
 end
 
-#-----------------------------------------------------------------------------# File
-struct File
-    path::String
-    builddir::String
-    File(path::String, builddir::String = "assets/") = new(path, builddir)
-end
-Base.show(io::IO, file::File) = file.buildir * file.path
-
 #-----------------------------------------------------------------------------# Node
+"""
+    Node(tag::String, attrs::Dict{String,String}, children::Vector)
+
+Should not often be used directly.  See `?Cobweb.h`.
+"""
 struct Node
     tag::String
-    attrs::Dict{String,Union{File, String}}
+    attrs::Dict{String,String}
     children::Vector
-    function Node(tag, attrs, children)
-        new(tag, attrs, children)
-    end
+end
+tag(o::Node) = getfield(o, :tag)
+attrs(o::Node) = getfield(o, :attrs)
+children(o::Node) = getfield(o, :children)
+
+
+function Base.:(==)(a::Node, b::Node)
+    tag(a) == tag(b) &&
+        attrs(a) == attrs(b) &&
+        length(children(a)) == length(children(b)) &&
+        all(ac == bc for (ac,bc) in zip(children(a), children(b)))
 end
 
 function Base.getproperty(node::Node, class::String)
-    node.attrs["class"] = class
+    d = attrs(node)
+    if haskey(d, "class")
+        d["class"] = d["class"] * " $class"
+    else
+        d["class"] = class
+    end
     node
 end
 
-get_attrs(kw) = Dict(string(k) => v isa File ? v : string(v) for (k,v) in kw)
+Base.getproperty(node::Node, name::Symbol) = getfield(node, :attrs)[string(name)]
+Base.setproperty!(node::Node, name::Symbol, x) = getfield(node, :attrs)[string(name)] = string(x)
 
-(node::Node)(children...; kw...) = Node(node.tag, merge(node.attrs, get_attrs(kw)), vcat(node.children, children...))
+Base.getindex(node::Node, i::Integer) = children(node)[i]
+Base.setindex!(node::Node, x, i::Integer) = setindex!(children(node), x, i)
+
+get_attrs(kw) = Dict(string(k) => string(v) for (k,v) in kw)
+
+(node::Node)(x...; kw...) = Node(tag(node), merge(attrs(node), get_attrs(kw)), vcat(children(node), x...))
 
 #-----------------------------------------------------------------------------# h
+"""
+    h(tag, children...; kw...)
+    h.tag(children...; kw...)
+    h.tag."classes"(children...; kw...)
+
+Create an html node with the given `tag`, `children`, and `kw` attributes.
+
+### Examples
+
+    h.div("child", class="myclass", id="myid")
+    # <div class="myclass" id="myid">child</div>
+
+    h.div."myclass"("content")
+    # <div class="myclass">content</div>
+"""
 h(tag, children...; kw...) = Node(tag, get_attrs(kw), collect(children))
 
 h(tag, attrs::Dict, children...) = Node(tag, attrs, collect(children))
 
-function Base.getproperty(::typeof(h), tag::Symbol)
-    f(children...; kw...) = h(String(tag), children...; kw...)
-    return f
-end
+Base.getproperty(::typeof(h), tag::Symbol) = h(string(tag))
+Base.propertynames(::typeof(h)) = HTML5_TAGS
+
+#-----------------------------------------------------------------------------# @h
+HTML5_TAGS = [:a,:abbr,:address,:area,:article,:aside,:audio,:b,:base,:bdi,:bdo,:blockquote,:body,:br,:button,:canvas,:caption,:cite,:code,:col,:colgroup,:data,:datalist,:dd,:del,:details,:dfn,:dialog,:div,:dl,:dt,:em,:embed,:fieldset,:figcaption,:figure,:footer,:form,:h1,:h2,:h3,:h4,:h5,:h6,:head,:header,:hgroup,:hr,:html,:i,:iframe,:img,:input,:ins,:kbd,:label,:legend,:li,:link,:main,:map,:mark,:math,:menu,:menuitem,:meta,:meter,:nav,:noscript,:object,:ol,:optgroup,:option,:output,:p,:param,:picture,:pre,:progress,:q,:rb,:rp,:rt,:rtc,:ruby,:s,:samp,:script,:section,:select,:slot,:small,:source,:span,:strong,:style,:sub,:summary,:sup,:svg,:table,:tbody,:td,:template,:textarea,:tfoot,:th,:thead,:time,:title,:tr,:track,:u,:ul,:var,:video,:wbr]
 
 macro h(ex)
     esc(_h(ex))
@@ -57,109 +93,75 @@ function _h(ex::Expr)
         x = ex.args[i]
         if x isa Expr
             ex.args[i] = _h(x)
-        elseif x isa Symbol
+        elseif x isa Symbol && x in HTML5_TAGS
             ex.args[i] = Expr(:., :(Cobweb.h), QuoteNode(ex.args[1]))
         end
     end
     ex
 end
+_h(x::Symbol) = x in HTML5_TAGS ? Expr(:., :(Cobweb.h), QuoteNode(x)) : x
 
 #-----------------------------------------------------------------------------# escapeHTML
-# Taken from HTTPCommon.jl (ref: http://stackoverflow.com/a/7382028/3822752)
-function escape_html(x::String)
-    s = replace(x,  "&"=>"&amp;")
-    s = replace(s, "\""=>"&quot;")
-    s = replace(s, "'"=>"&#39;")
-    s = replace(s, "<"=>"&lt;")
-    replace(s, ">"=>"&gt;")
-end
+escape_chars = ['&' => "&amp;", '"' => "&quot;", ''' => "&#39;", '<' => "&lt;", '>' => "&gt;"]
+escape(x) = replace(string(x), escape_chars...)
+unescape(x::AbstractString) = replace(x, reverse.(escape_chars)...)
 
 #-----------------------------------------------------------------------------# show (html)
-pretty(x) = (io = IOBuffer(); pretty(io, x); String(take!(io)))
-
-pretty(io::IO, node::Node) = show(IOContext(io, :pretty=>true), node)
-
 function Base.show(io::IO, node::Node)
     color = get(io, :tagcolor, 1)
-    pretty = get(io, :pretty, false)
-    level = pretty ? get(io, :level, 0) : 0
-    indent = pretty ? ' ' ^ get(io, :indent, 2) : ""
     p(args...) = printstyled(io, args...; color)
-    p(indent ^ level, '<', node.tag)
-    for (k,v) in node.attrs
+    # opening tag
+    p('<', tag(node))
+    for (k,v) in attrs(node)
         if v == "true"
             p(' ', k)
-        elseif v == "false"
-        else
+        elseif v != "false"
             p(' ', k, '=', '"', v, '"')
         end
     end
     p('>')
-    has_node_children = any(x -> x isa Node, node.children)
-    pretty && has_node_children && p('\n')
-    n_nodes = 0
-    for (i, child) in enumerate(node.children)
-        if child isa String
-            has_node_children ?
-                p(indent ^ (level + 1), escape_html(child), '\n') :
-                p(escape_html(child))
-        elseif child isa Node
-            show(IOContext(io, :tagcolor => color + i + n_nodes, :level => level+1), MIME("text/html"), child)
-            n_nodes = sum(x -> x isa Node, child.children, init=0)
+    # children
+    for (i, child) in enumerate(children(node))
+        if child isa Union{AbstractString, Number, Symbol}
+            p(child)
         else
-            show(io, MIME("text/html"), child)
+            hasmethod(show, Tuple{IO, MIME"text/html", typeof(child)}) ?
+                show(IOContext(io, :tagcolor => color + i), MIME("text/html"), child) :
+                error("Child element of type `$(typeof(child))` does not have a text/html representation.")
         end
     end
-    if has_node_children
-        p(indent ^ level, "</", node.tag, '>')
-    else
-        p("</", node.tag, '>')
-    end
-    pretty && println(io)
+    # closing tag
+    p("</", tag(node), '>')
 end
+
 Base.show(io::IO, ::MIME"text/html", node::Node) = show(io, node)
+Base.show(io::IO, ::MIME"text/xml", node::Node) = show(io, node)
+Base.show(io::IO, ::MIME"application/xml", node::Node) = show(io, node)
+
+pretty(args...) = error("The `pretty` function has been removed from Cobweb.")
 
 #-----------------------------------------------------------------------------# show (javascript)
 struct Javascript
     x::String
 end
 Base.show(io::IO, ::MIME"text/javascript", j::Javascript) = print(io, j.x)
-function Base.show(io::IO, ::MIME"text/html", j::Javascript)
-    print(io, "<script>")
-    print(io, j.x)
-    print(io, "</script>")
-end
-
-function Base.show(io::IO, M::MIME"text/javascript", node::Node)
-    print(io, "m(\"", node.tag, "\", ")
-    write_javascript(io, node.attrs)
-    for child in node.children
-        print(io, ", ")
-        write_javascript(io, child)
-    end
-    print(io, ")")
-end
-
-write_javascript(io::IO, x) = show(io, MIME"text/javascript"(), x)
-
-write_javascript(io::IO, ::Nothing) = print(io, "null")
-write_javascript(io::IO, x::String) = print(io, '"', x, '"')
-write_javascript(io::IO, x::Union{Bool, Real}) = print(io, x)
-function write_javascript(io::IO, x::AbstractDict)
-    if isempty(x)
-        print(io, "null")
-    else
-        print(io, '{')
-        for (i,(k,v)) in enumerate(x)
-            print(io, k, ':')
-            write_javascript(io, v)
-            i != length(x) && print(io, ", ")
-        end
-        print(io,'}')
-    end
-end
+Base.show(io::IO, ::MIME"text/html", j::Javascript) = print(io, "<script>", j.x, "</script>")
 
 #-----------------------------------------------------------------------------# CSS
+"""
+    CSS(dictionary)
+
+Write CSS with a nested dictionary with keys (`selector => (property => value)`).
+
+### Example
+
+    CSS(Dict(
+        "p" => Dict(
+            "font-family" => "Arial",
+            "text-transform" => "uppercase"
+        )
+    ))
+"""
 struct CSS
     content::Dict{String, Dict{String,String}}
     function CSS(o::AbstractDict)
@@ -175,36 +177,97 @@ function Base.show(io::IO, o::CSS)
         println(io, '}')
     end
 end
+Base.show(io::IO, ::MIME"text/css", o::CSS) = print(io, o)
 function Base.show(io::IO, ::MIME"text/html", o::CSS)
     println(io, "<style>")
     print(io, o)
     println(io, "</style>")
 end
+save(file::String, o::CSS) = save(o, file)
+save(o::CSS, file::String) = open(io -> show(io, x), touch(file), "w")
+
+#-----------------------------------------------------------------------------# Doctype
+"""
+    Cobweb.Doctype()
+
+Inserts into HTML as `<!doctype html>`.
+"""
+struct Doctype end
+Base.show(io::IO, o::Doctype) = print(io, "<!doctype html>")
+Base.show(io::IO, ::MIME"text/html", o::Doctype) = show(io, o)
+
+#-----------------------------------------------------------------------------# Comment
+"""
+    Comment(x)
+
+Inserts into HTML as `<!-- \$(string(x)) ->`.
+"""
+struct Comment
+    x::String
+    Comment(x) = new(string(x))
+end
+Base.show(io::IO, o::Comment) = print(io, "<!-- ", o.x, " -->")
+Base.show(io::IO, ::MIME"text/html", o::Comment) = show(io, o)
 
 #-----------------------------------------------------------------------------# Page
+"""
+    Page(content)
+
+Wrapper to display `content` in your web browser.  Assumes `content` has an available
+show method for `MIME("text/html")`.
+"""
 struct Page
     content
-    route::String
-    Page(content, route="/") = new(content, route)
 end
-function scratch_file(page::Page)
-    dir = mkpath(joinpath(DIR, split(page.route, '/', keepempty=false)...))
-    touch(joinpath(dir, "index.html"))
-end
+Page(pg::Page) = pg
 
 save(file::String, page::Page) = save(page, file)
 
-function save(page::Page, file=scratch_file(page))
-    Base.open(file, "w") do io
+function save(page::Page, file=joinpath(DIR, "index.html"))
+    Base.open(touch(file), "w") do io
         println(io, "<!doctype html>")
         show(io, MIME("text/html"), page.content)
     end
     file
 end
 
-function Base.display(::CobwebDisplay, page::Page)
-    save(page)
-    DefaultApplication.open(scratch_file(page))
+Base.display(::CobwebDisplay, page::Page) = DefaultApplication.open(save(page))
+
+#-----------------------------------------------------------------------------# StructTypes
+StructTypes.StructType(::Type{Node})        = StructTypes.Struct()
+StructTypes.StructType(::Type{Javascript})  = StructTypes.Struct()
+StructTypes.StructType(::Type{CSS})         = StructTypes.Struct()
+StructTypes.StructType(::Type{Doctype})     = StructTypes.Struct()
+StructTypes.StructType(::Type{Page})        = StructTypes.Struct()
+
+#-----------------------------------------------------------------------------# iframe
+"""
+    iframe(x)
+
+Create an <iframe> (without a `src`) using the text/html representation of `x
+Useful for embedding dynamically-generated content.
+"""
+function iframe(x; height=250, width=750)
+    id = randstring(10)
+    x = x isa Union{AbstractString, Number, Symbol} ? HTML(string(x)) : x
+    h.div(
+        h.div(repr("text/html", x); id="content-for-$id", style="display: none;"),
+        h.iframe(; height, width, src="about:blank", style="border:none;", id),
+        h.script("""
+        var content = document.getElementById("content-for-$id").innerHTML;
+        var iframe = document.getElementById("$id");
+
+        var frameDoc = iframe.document;
+        if (iframe.contentWindow)
+            frameDoc = iframe.contentWindow.document;
+
+        frameDoc.open();
+        frameDoc.writeln(content);
+        frameDoc.close();
+        """)
+    )
 end
+
+include("parser.jl")
 
 end #module
